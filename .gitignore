@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+fw-venv/
+venv/
+
+# 上游源码（faster-whisper 官方仓库）
+faster-whisper-master/
+
+# 测试与临时文件
+test_batch/
+test1.flac
+*.wav
+*.flac
+*.mp3
+*.mp4
+
+# 生成物（字幕、便携包、压缩包）
+输出字幕/
+转写字幕/
+便携版/
+便携包/
+*.zip
+.preview/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
