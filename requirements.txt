@@ -1,0 +1,16 @@
+# faster-whisper 批量转写工具 - 依赖
+# 安装:  pip install -r requirements.txt
+# 实测环境: Python 3.13.0 / Windows 11 / faster-whisper 1.2.1
+
+faster-whisper>=1.2.0,<2.0
+ctranslate2>=4.0,<5.0
+numpy>=1.24
+av>=11.0
+
+# Silero VAD 需要（faster-whisper 会自动拉，显式列出便于排查）
+onnxruntime>=1.16
+
+# ---------------- 可选：GPU 支持（NVIDIA 显卡 + CUDA 12） ----------------
+# 只有需要 GPU 加速时才装。ctranslate2 需要 cublas64_12.dll / cudnn。
+#   pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+# 不装也能跑，会自动回退 CPU(int8)，只是慢一些。

@@ -1,90 +1,78 @@
 # -*- coding: utf-8 -*-
 """faster-whisper 批量转写脚本
+
 用法:
-  python batch_transcribe.py <文件夹或文件> [模型名] [--srt 输出目录]
+  python batch_transcribe.py <文件夹或文件...> [--model 模型名或目录] [--srt 输出目录] [--no-srt]
+
 示例:
-  python batch_transcribe.py D:\我的音频 small
-  python batch_transcribe.py D:\我的音频 small --srt D:\字幕
+  python batch_transcribe.py D:\\我的音频
+  python batch_transcribe.py D:\\我的音频 --model medium --srt D:\\字幕
+  python batch_transcribe.py D:\\素材 --model models\\large-v3 --device cpu
+  python batch_transcribe.py D:\\素材 --workers 2
+
 说明:
   - 遍历文件夹下所有音视频文件(递归)，逐个转写
-  - 每个文件自动检测语言，直接告诉你是什么语言(中文名+代码+置信度)
-  - --srt 目录: 同时把每个文件导出为同名 .srt 字幕
+  - 每个文件自动检测语言，输出中文名+代码+置信度
+  - 默认导出同名 .srt 字幕到 桌面\\转写字幕
 """
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import List, Optional, Set
 
-import ctranslate2
-import numpy as np
-from faster_whisper import WhisperModel
+# 嵌入式 Python（python313._pth）不会把脚本目录进 sys.path，
+# 不手动补一下，便携版里 import whisper_common 会直接 ModuleNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from whisper_common import (  # noqa: E402  (必须在 sys.path 补齐之后导入)
+    MODEL_SIZES,
+    announce_model,
+    fmt_time,
+    lang_name,
+    load_model,
+    pad,
+    truncate_disp,
+    warn_if_slow_on_cpu,
+)
 
-def load_model(model_path, device="auto"):
-    """加载模型；device=auto 时检测 GPU 是否真正可用（含 CUDA 运行库），否则回退 CPU"""
-    if device == "auto":
-        try:
-            if ctranslate2.get_cuda_device_count() > 0:
-                print("检测到 NVIDIA 显卡，尝试 GPU 加速...")
-                m = WhisperModel(model_path, device="cuda", compute_type="float16")
-                # 真实推理探测：确认 cublas/cudnn 运行库可用
-                m.encode(np.zeros((80, 3000), dtype="float32"))
-                print("GPU 加速可用 (float16)")
-                return m, "cuda/float16"
-        except Exception as e:
-            print(f"GPU 不可用 ({e})，回退 CPU ...")
-        print("使用 CPU 模式 (int8) ...")
-        return WhisperModel(model_path, device="cpu", compute_type="int8"), "cpu/int8"
-    if device == "cuda":
-        return WhisperModel(model_path, device="cuda", compute_type="float16"), "cuda/float16"
-    return WhisperModel(model_path, device="cpu", compute_type="int8"), "cpu/int8"
-
-# 常见语言代码 -> 中文名（faster-whisper 返回 ISO 639-1 代码）
-LANG_NAMES = {
-    "en": "英语", "zh": "中文", "yue": "粤语", "ja": "日语", "ko": "韩语",
-    "fr": "法语", "de": "德语", "es": "西班牙语", "pt": "葡萄牙语",
-    "it": "意大利语", "ru": "俄语", "ar": "阿拉伯语", "hi": "印地语",
-    "bn": "孟加拉语", "ur": "乌尔都语", "vi": "越南语", "th": "泰语",
-    "id": "印尼语", "ms": "马来语", "tl": "他加禄语", "nl": "荷兰语",
-    "pl": "波兰语", "tr": "土耳其语", "uk": "乌克兰语", "he": "希伯来语",
-    "sv": "瑞典语", "no": "挪威语", "da": "丹麦语", "fi": "芬兰语",
-    "cs": "捷克语", "el": "希腊语", "hu": "匈牙利语", "ro": "罗马尼亚语",
-    "fa": "波斯语", "ta": "泰米尔语", "te": "泰卢固语", "kn": "卡纳达语",
-    "ml": "马拉雅拉姆语", "si": "僧伽罗语", "ne": "尼泊尔语", "km": "高棉语",
-    "lo": "老挝语", "my": "缅甸语", "mn": "蒙古语", "kk": "哈萨克语",
-    "uz": "乌兹别克语", "az": "阿塞拜疆语", "ka": "格鲁吉亚语", "hy": "亚美尼亚语",
-    "sw": "斯瓦希里语", "af": "南非荷兰语", "is": "冰岛语", "et": "爱沙尼亚语",
-    "lv": "拉脱维亚语", "lt": "立陶宛语", "sl": "斯洛文尼亚语", "sk": "斯洛伐克语",
-    "hr": "克罗地亚语", "sr": "塞尔维亚语", "bg": "保加利亚语", "mk": "马其顿语",
-    "sq": "阿尔巴尼亚语", "bs": "波斯尼亚语", "ca": "加泰罗尼亚语", "eu": "巴斯克语",
-    "gl": "加利西亚语", "cy": "威尔士语", "mt": "马耳他语", "ha": "豪萨语",
-    "am": "阿姆哈拉语", "jw": "爪哇语", "su": "巽他语", "pa": "旁遮普语",
-    "gu": "古吉拉特语", "or": "奥里亚语", "as": "阿萨姆语",
-}
+DEFAULT_MODEL = "large-v3"
 
 AUDIO_EXTS = (
     ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma",
     ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".wmv",
 )
 
-
-def lang_name(code):
-    """语言代码 -> 中文名"""
-    return LANG_NAMES.get(code, code)
+# Windows 单路径上限 260，留点余量给扩展名和系统开销
+MAX_PATH_LEN = 250
 
 
-def fmt_time(seconds):
-    """秒 -> 字幕时间戳格式 00:00:00,000"""
-    ms = int(round(seconds * 1000))
-    h, rem = divmod(ms, 3600000)
-    m, rem = divmod(rem, 60000)
-    s, ms = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+@dataclass
+class Result:
+    name: str
+    path: str
+    lang: str = "-"
+    code: str = "-"
+    prob: float = 0.0
+    duration: float = 0.0
+    elapsed: float = 0.0
+    status: str = "failed"          # ok / no_speech / failed
+    error: str = ""
+    srt_path: str = ""
 
 
-def collect_files(paths):
-    """收集待转写文件：可传多个文件或文件夹(递归)，自动去重"""
+def collect_files(paths: List[str], skip_dirs: List[str]) -> List[str]:
+    """收集待转写文件：可传多个文件或文件夹(递归)，自动去重，跳过输出目录"""
+    skip = {os.path.normcase(os.path.abspath(p)) for p in skip_dirs if p}
     files, seen = [], set()
+
+    def _skipped(path: str) -> bool:
+        return os.path.normcase(os.path.abspath(path)) in skip
+
     for path in paths:
         if os.path.isfile(path):
             real = os.path.abspath(path)
@@ -92,7 +80,11 @@ def collect_files(paths):
                 seen.add(real)
                 files.append(real)
         elif os.path.isdir(path):
-            for root, _, names in os.walk(path):
+            if _skipped(path):
+                continue
+            for root, dirs, names in os.walk(path):
+                # 不让输出目录混进扫描结果
+                dirs[:] = [d for d in dirs if not _skipped(os.path.join(root, d))]
                 for name in names:
                     if name.lower().endswith(AUDIO_EXTS):
                         real = os.path.join(root, name)
@@ -101,20 +93,62 @@ def collect_files(paths):
                             files.append(real)
         else:
             print(f"路径不存在(已跳过): {path}")
+
     files.sort()
     return files
 
 
-def transcribe_one(model, filepath, srt_dir):
-    """转写单个文件，返回 (语言中文名, 语言代码, 概率, 时长, 耗时, 状态)"""
+def build_srt_path(out_dir: str, src_path: str, lang: str, prob: float, used: Set[str]) -> str:
+    """生成不重复的字幕路径。
+
+    - 同一批里不同目录存在同名文件时，用父目录名做前缀，仍冲突再加 _2/_3
+    - 路径过长时截断文件名，避免 Windows 260 字符限制
+    """
+    stem = os.path.splitext(os.path.basename(src_path))[0]
+    base = f"{stem}_{lang}_{prob:.1%}"
+
+    candidate = base
+    if candidate.lower() in used:
+        parent = os.path.basename(os.path.dirname(src_path)) or "root"
+        candidate = f"{parent}_{base}"
+
+    index = 2
+    final = candidate
+    while final.lower() in used:
+        final = f"{candidate}_{index}"
+        index += 1
+    used.add(final.lower())
+
+    full = os.path.join(out_dir, final + ".srt")
+    if len(full) > MAX_PATH_LEN:
+        keep = max(20, len(final) - (len(full) - MAX_PATH_LEN))
+        final = final[:keep]
+        used.add(final.lower())
+        full = os.path.join(out_dir, final + ".srt")
+    return full
+
+
+def write_srt(srt_path: str, lines: List[tuple]) -> None:
+    """写 SRT。lines 为空时写空文件：条数为 0，导入剪映/PR 后不会多出字幕。"""
+    with open(srt_path, "w", encoding="utf-8", newline="\n") as f:
+        for i, (start, end, text) in enumerate(lines, 1):
+            f.write(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{text}\n\n")
+
+
+def transcribe_one(model, filepath: str, srt_dir: Optional[str], used_names: Set[str],
+                   quiet: bool = False) -> Result:
+    """转写单个文件，返回 Result"""
+    res = Result(name=os.path.basename(filepath), path=filepath)
     t0 = time.time()
     segments, info = model.transcribe(filepath, beam_size=5, vad_filter=True)
-    # 语言信息（第一段输出即答案）
-    lang = lang_name(info.language)
-    prob = info.language_probability
 
-    print(f"\n=== 转写: {os.path.basename(filepath)} ===")
-    print(f"   检测语言: {lang} ({info.language})  置信度: {prob:.1%}")
+    res.lang = lang_name(info.language)
+    res.code = info.language
+    res.prob = info.language_probability
+    res.duration = info.duration
+
+    print(f"\n=== 转写: {res.name} ===")
+    print(f"   检测语言: {res.lang} ({res.code})  置信度: {res.prob:.1%}")
     print(f"   音频时长: {info.duration:.1f}s (VAD后 {info.duration_after_vad:.1f}s)")
 
     lines = []
@@ -122,102 +156,206 @@ def transcribe_one(model, filepath, srt_dir):
         text = seg.text.strip()
         if not text:
             continue
-        print(f"   [{seg.start:7.2f}s -> {seg.end:7.2f}s] {text}")
+        if not quiet:
+            print(f"   [{seg.start:7.2f}s -> {seg.end:7.2f}s] {text}")
         lines.append((seg.start, seg.end, text))
 
-    elapsed = time.time() - t0
-    print(f"   转写耗时: {elapsed:.1f}s")
+    res.elapsed = time.time() - t0
+    print(f"   转写耗时: {res.elapsed:.1f}s")
 
-    stem = os.path.splitext(os.path.basename(filepath))[0]
-    srt_name = f"{stem}_{lang}_{prob:.1%}.srt"
+    res.status = "ok" if lines else "no_speech"
 
     if srt_dir:
         os.makedirs(srt_dir, exist_ok=True)
-        srt_path = os.path.join(srt_dir, srt_name)
+        srt_path = build_srt_path(srt_dir, filepath, res.lang, res.prob, used_names)
+        write_srt(srt_path, lines)
+        res.srt_path = srt_path
         if lines:
-            # 正常: 写转写文本
-            with open(srt_path, "w", encoding="utf-8") as f:
-                for i, (st, en, txt) in enumerate(lines, 1):
-                    f.write(f"{i}\n{fmt_time(st)} --> {fmt_time(en)}\n{txt}\n\n")
             print(f"   字幕已保存: {srt_path}")
         else:
-            # 无语音: 也生成字幕文件，内容标注原因（文件数和视频数对得上）
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write(f"1\n{fmt_time(0)} --> {fmt_time(1)}\n未检测到语音\n\n")
-            print(f"   ⚠️ 未检测到语音，已生成占位字幕: {srt_path}")
-
-    status = "ok" if lines else "no_speech"
-    return lang, info.language, prob, info.duration, elapsed, status
+            # 空文件而不是"未检测到语音"占位——占位文本会被剪映当真字幕烧进画面
+            print(f"   未检测到语音，已生成空字幕(0 条): {srt_path}")
+    return res
 
 
-def get_desktop():
+def get_desktop() -> str:
     """返回真实桌面路径（兼容 OneDrive 重定向）"""
     home = os.path.expanduser("~")
     for candidate in (
         os.path.join(home, "Desktop"),
         os.path.join(home, "OneDrive", "Desktop"),
         os.path.join(home, "OneDrive", "桌面"),
+        os.path.join(home, "桌面"),
     ):
         if os.path.isdir(candidate):
             return candidate
     return os.path.join(home, "Desktop")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="faster-whisper 批量转写")
+def write_log(log_path: str, results: List[Result], device_tag: str, model_arg: str,
+              interrupted: bool) -> None:
+    """把整批结果落盘，控制台关了也查得到"""
+    try:
+        with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"运行时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"模型: {model_arg}    设备: {device_tag}\n")
+            f.write(f"文件数: {len(results)}"
+                    + ("（被中断，仅记录已完成部分）" if interrupted else "") + "\n")
+            f.write("-" * 100 + "\n")
+            for r in results:
+                f.write(f"[{r.status}] {r.path}\n")
+                f.write(f"         语言={r.lang}({r.code}) 置信度={r.prob:.1%} "
+                        f"时长={r.duration:.1f}s 耗时={r.elapsed:.1f}s\n")
+                if r.srt_path:
+                    f.write(f"         字幕={r.srt_path}\n")
+                if r.error:
+                    f.write(f"         错误={r.error}\n")
+        print(f"运行日志: {log_path}")
+    except OSError as exc:
+        print(f"(日志写入失败: {exc})")
+
+
+def print_summary(results: List[Result], total_files: int) -> None:
+    """汇总表：按显示宽度对齐，中文文件名不再错列"""
+    w_name, w_lang, w_prob, w_dur, w_el = 36, 16, 10, 12, 10
+    print(f"\n{'='*94}\n汇总\n{'='*94}")
+    header = (pad("文件名", w_name) + pad("语言", w_lang) + pad("置信度", w_prob)
+              + pad("时长", w_dur) + pad("耗时", w_el) + "状态")
+    print(header)
+    print("-" * 94)
+
+    for r in results:
+        if r.status == "failed":
+            print(pad(truncate_disp(r.name, w_name), w_name)
+                  + pad("转写失败", w_lang) + f"({r.error[:28]})")
+            continue
+        status_txt = "无语音" if r.status == "no_speech" else "ok"
+        print(pad(truncate_disp(r.name, w_name), w_name)
+              + pad(f"{r.lang}({r.code})", w_lang)
+              + pad(f"{r.prob:.1%}", w_prob)
+              + pad(f"{r.duration:.1f}s", w_dur)
+              + pad(f"{r.elapsed:.1f}s", w_el)
+              + status_txt)
+
+    n_ok = sum(1 for r in results if r.status == "ok")
+    n_no = sum(1 for r in results if r.status == "no_speech")
+    n_bad = sum(1 for r in results if r.status == "failed")
+    total_el = sum(r.elapsed for r in results)
+    print(f"\n共 {total_files} 个文件，已完成 {len(results)} 个"
+          f"（正常 {n_ok} / 无语音 {n_no} / 失败 {n_bad}），"
+          f"转写累计耗时 {total_el:.1f}s")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="faster-whisper 批量转写（默认模型 large-v3）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n"
+               "  python batch_transcribe.py D:\\视频\n"
+               "  python batch_transcribe.py D:\\视频 --model medium --srt D:\\字幕\n"
+               "  python batch_transcribe.py a.mp4 b.mp4 --model models\\large-v3 --device cpu\n",
+    )
     parser.add_argument("path", nargs="+", help="音频文件或文件夹路径，可传多个(支持拖放)")
-    parser.add_argument("--model", default="small", help="模型名或本地模型目录路径")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="auto=自动检测(默认)")
-    parser.add_argument("--srt", help="可选: 指定字幕导出目录")
-    parser.add_argument("--no-srt", action="store_true", help="不导出字幕")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"模型名或本地模型目录，默认 {DEFAULT_MODEL}")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
+                        help="auto=自动检测(默认)，cuda=强制GPU")
+    srt_group = parser.add_mutually_exclusive_group()
+    srt_group.add_argument("--srt", help="字幕导出目录，默认 桌面\\转写字幕")
+    srt_group.add_argument("--no-srt", action="store_true", help="不导出字幕")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并发线程数，默认 1（串行）。GPU 上 2-4 通常更快；"
+                             "CPU 上几乎无收益（int8 已多线程吃满 CPU，并发只会互相抢核）")
+    parser.add_argument("--quiet", action="store_true", help="不打印逐句文本")
     args = parser.parse_args()
 
-    files = collect_files(args.path)
-    if not files:
-        print("没有找到可转写的音视频文件。")
-        sys.exit(1)
+    if args.workers < 1:
+        parser.error("--workers 必须 >= 1")
 
-    # 字幕默认输出到 桌面\转写字幕
+    # 防呆：把模型名写在位置参数里（老文档的坑）会静默用错模型，这里直接报错
+    misplaced = [p for p in args.path if not os.path.exists(p) and p in MODEL_SIZES]
+    if misplaced:
+        parser.error(
+            f"'{misplaced[0]}' 看起来是模型名，但被当成了输入路径。"
+            f"模型请用 --model {misplaced[0]} 传入。"
+        )
+
+    # 字幕输出目录：默认 桌面\转写字幕
     if args.no_srt:
         srt_dir = None
-    elif args.srt:
-        srt_dir = args.srt
+        print("已指定 --no-srt，不导出字幕")
     else:
-        srt_dir = os.path.join(get_desktop(), "转写字幕")
-    if srt_dir:
+        srt_dir = args.srt or os.path.join(get_desktop(), "转写字幕")
         print(f"字幕将保存到: {srt_dir}")
 
-    print(f"找到 {len(files)} 个文件，加载模型 {args.model} ...")
+    files = collect_files(args.path, [srt_dir] if srt_dir else [])
+    if not files:
+        print("没有找到可转写的音视频文件。")
+        print(f"支持的扩展名: {', '.join(AUDIO_EXTS)}")
+        return 1
+
+    print(f"找到 {len(files)} 个文件，准备加载模型 {args.model} ...")
+    announce_model(args.model)
+
     t0 = time.time()
-    model, device_name = load_model(args.model, args.device)
-    print(f"模型加载完成 ({device_name})，耗时 {time.time()-t0:.1f}s")
+    try:
+        model, device_tag = load_model(args.model, args.device)
+    except Exception as exc:
+        print(f"\n模型加载失败: {exc}")
+        return 2
+    print(f"模型加载完成 ({device_tag})，耗时 {time.time()-t0:.1f}s")
+    warn_if_slow_on_cpu(device_tag, args.model)
+    if args.workers > 1 and device_tag.startswith("cpu"):
+        print("提示: CPU 模式下多线程没有收益（int8 已吃满所有核心），"
+              "实测 --workers 2 反而更慢，建议保持默认 1。")
 
-    print(f"\n{'='*60}\n开始批量转写 {len(files)} 个文件...\n{'='*60}")
-    summary = []
-    for i, fp in enumerate(files, 1):
-        print(f"\n----- [{i}/{len(files)}] {fp} -----")
-        try:
-            summary.append((os.path.basename(fp), *transcribe_one(model, fp, srt_dir)))
-        except Exception as e:
-            print(f"   !! 转写失败: {e}")
-            summary.append((os.path.basename(fp), "失败", "-", 0, 0, 0, "failed"))
+    used_names: Set[str] = set()
+    results: List[Result] = []
+    total = len(files)
+    log_path = os.path.join(srt_dir, "转写日志.txt") if srt_dir else None
 
-    # 汇总表
-    print(f"\n{'='*60}\n汇总\n{'='*60}")
-    print(f"{'文件名':<36}{'语言':<12}{'置信度':<10}{'时长':<10}{'耗时':<8}{'状态'}")
-    print("-" * 90)
-    for row in summary:
-        name, lang, code, prob, dur, el, status = row
-        if status == "failed":
-            print(f"{name:<36}{'转写失败':<10}")
+    print(f"\n{'='*60}\n开始批量转写 {total} 个文件（并发 {args.workers}）...\n{'='*60}")
+
+    interrupted = False
+    try:
+        if args.workers == 1:
+            for i, fp in enumerate(files, 1):
+                print(f"\n----- [{i}/{total}] {fp} -----")
+                try:
+                    results.append(transcribe_one(model, fp, srt_dir, used_names, args.quiet))
+                except Exception as exc:
+                    print(f"   !! 转写失败: {exc}")
+                    results.append(Result(name=os.path.basename(fp), path=fp, error=str(exc)))
         else:
-            status_txt = "" if status == "ok" else "⚠️ 无语音"
-            print(f"{name:<36}{lang+'('+code+')':<14}{prob:<11.1%}{dur:.1f}s{'':<6}{el:.1f}s{'':<4}{status_txt}")
-    n_ok = sum(1 for r in summary if r[6] == "ok")
-    n_nospeech = sum(1 for r in summary if r[6] == "no_speech")
-    n_fail = sum(1 for r in summary if r[6] == "failed")
-    print(f"\n全部完成: {len(files)} 个文件 (正常 {n_ok} / 无语音 {n_nospeech} / 失败 {n_fail})，总耗时 {sum(r[5] for r in summary if r[6]!='failed'):.1f}s")
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = {
+                    pool.submit(transcribe_one, model, fp, srt_dir, used_names, True): fp
+                    for fp in files
+                }
+                for i, fut in enumerate(as_completed(futures), 1):
+                    fp = futures[fut]
+                    try:
+                        res = fut.result()
+                        results.append(res)
+                        print(f"[{i}/{total}] {res.status:9s} {res.name}  "
+                              f"{res.lang}({res.code}) {res.prob:.1%} {res.elapsed:.1f}s")
+                    except Exception as exc:
+                        print(f"[{i}/{total}] failed    {os.path.basename(fp)}  ({exc})")
+                        results.append(Result(name=os.path.basename(fp), path=fp, error=str(exc)))
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n已中断（Ctrl+C）。已完成的结果保留，下面只汇总已完成的文件。")
+
+    order = {fp: i for i, fp in enumerate(files)}
+    results.sort(key=lambda r: order.get(r.path, 9999))
+
+    print_summary(results, total)
+    if log_path:
+        os.makedirs(srt_dir, exist_ok=True)
+        write_log(log_path, results, device_tag, args.model, interrupted)
+
+    return 130 if interrupted else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

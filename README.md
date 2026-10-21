@@ -1,8 +1,10 @@
 # 🎙️ Faster-Whisper 批量转写工具
 
-> 本地离线 · 批量转写 · 自动语言检测 · SRT 字幕导出
+> 本地运行 · 批量转写 · 自动语言检测 · SRT 字幕导出 · 默认 large-v3
 
-一个基于 **faster-whisper** 的本地语音转文字（ASR）批量工具：把整个文件夹的短视频/音频一次性拖进去，自动识别**每段说的是什么语言（含置信度）**，并导出标准 **SRT 字幕**。全程本地运行，不联网、不上传，内容不经过任何第三方。
+一个基于 **faster-whisper** 的本地语音转文字（ASR）批量工具：把整个文件夹的短视频/音频一次性转完，自动识别**每段说的是什么语言（含置信度）**，导出标准 **SRT 字幕**。识别全在本机完成，音频不上传任何第三方。
+
+> ⚠️ 首次运行需要联网下载模型权重（large-v3 约 3.1GB），之后完全离线。
 
 ---
 
@@ -11,12 +13,105 @@
 | 能力 | 说明 |
 | --- | --- |
 | 🔄 批量转写 | 文件夹递归扫描 mp3/wav/flac/m4a/mp4/mkv/mov 等 16 种音视频格式 |
-| 🌍 语言自动检测 | 支持 99 种语言，输出**中文名 + 语言代码 + 置信度**（如 `印尼语 (id) 99.2%`） |
-| 📝 SRT 字幕导出 | 标准字幕格式，直接可导入剪映 / PR / B 站 |
-| 🏷️ 智能命名 | 字幕命名规则：`原文件名_语种_置信度.srt`（如 `画面 (73)_他加禄语_99.4%.srt`） |
-| 🔇 无语音标注 | 检测不到人声的视频也会生成占位字幕并标注"未检测到语音"，文件数与视频数严格对得上 |
-| 💻 设备自适应 | 有 NVIDIA 显卡自动走 GPU 加速；没有自动回退 CPU（int8 量化），任何电脑都能跑 |
-| 🎒 便携打包 | 可生成"解压即用"绿色版，发给别人无需装任何环境 |
+| 🌍 语言自动检测 | Whisper 支持 99 种语言，输出**中文名 + 语言代码 + 置信度**（如 `印尼语 (id) 99.2%`）；内置 76 种中文名，其余显示原始代码 |
+| 📝 SRT 字幕导出 | 标准 UTF-8 字幕，直接导入剪映 / PR / B 站 |
+| 🏷️ 智能命名 | `原文件名_语种_置信度.srt`，例如 `画面(73)_他加禄语_99.4%.srt`；**同批重名自动加 `_2`/`_3`，不会互相覆盖** |
+| 🔇 无语音处理 | 检测不到人声也会生成**空字幕（0 条）**，文件数与输入严格对得上，且导入剪映不会莫名多出一行字 |
+| 💻 设备自适应 | 有 NVIDIA 显卡自动走 GPU；GPU 不可用（缺 cuBLAS/cuDNN）自动回退 CPU(int8)，不会崩 |
+| 🧾 运行日志 | 每批生成 `转写日志.txt`，记录语言/置信度/耗时/失败原因，控制台关了也能查 |
+| 🎒 便携打包 | 可生成"解压即用"绿色包，对方无需装 Python |
+
+---
+
+## 安装
+
+需要 **Python 3.9+**（实测 3.13.0）。Windows / macOS / Linux 均可。
+
+```bash
+git clone https://github.com/xzzz0371-maker/faster-whisper-batch.git
+cd faster-whisper-batch
+pip install -r requirements.txt
+```
+
+**GPU 加速（可选，仅 NVIDIA）**：ctranslate2 需要 CUDA 12 的 `cublas64_12.dll` / cuDNN。
+
+```bash
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+不装也能正常用——程序会用一个空特征矩阵做**真实推理探测**，探测失败自动回退 CPU(int8)，并在控制台说明原因，不会出现"模型加载成功、转写时报 DLL 缺失"。
+
+---
+
+## 快速开始
+
+```bash
+# 最简：转写整个文件夹，字幕导出到 桌面\转写字幕，模型默认 large-v3
+python batch_transcribe.py D:\视频
+
+# 换小模型 + 指定字幕目录
+python batch_transcribe.py D:\视频 --model medium --srt D:\字幕
+
+# 用本地模型目录（离线环境）
+python batch_transcribe.py D:\素材 --model models\large-v3
+
+# 强制 CPU / 提高并发
+python batch_transcribe.py D:\素材 --device cpu --workers 2
+
+# 单文件
+python fw-demo.py 音频.mp4
+python fw-demo.py 音频.mp4 medium --srt out.srt
+```
+
+> 注意：模型必须用 `--model` 传，**不能**写成 `batch_transcribe.py D:\视频 medium`——那会把 `medium` 当成第二个输入路径。
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `path` | 必填 | 文件或文件夹，可传多个（支持拖放） |
+| `--model` | `large-v3` | 模型名或本地模型目录路径 |
+| `--device` | `auto` | `auto` / `cpu` / `cuda`（`cuda` 为强制，失败会报错并给修复建议） |
+| `--srt` | 桌面\转写字幕 | 字幕导出目录 |
+| `--no-srt` | — | 不导出字幕（与 `--srt` 互斥） |
+| `--workers` | `1` | 并发线程数；GPU 上 2-4 通常更快，**CPU 上无收益**（int8 已多线程吃满，并发只会互相抢核，实测反而更慢） |
+| `--quiet` | 关 | 不打印逐句文本 |
+
+---
+
+## 模型怎么选
+
+| 模型 | 体积 | 语言 | 适用场景 |
+| --- | --- | --- | --- |
+| `tiny` / `base` | 75MB / 145MB | 多语 | 只求快、内容简单，精度较差，不建议生产用 |
+| `small` | 460MB | 多语 | 弱机器快速过一遍 |
+| `medium` | 1.5GB | 多语 | **CPU 场景的性价比之选**，比 small 明显准 |
+| **`large-v3`**（默认） | 3.1GB | 多语 | 最准，8GB 显存可跑；多语种/小语种首选 |
+| `large-v3-turbo` | 1.6GB | 多语 | large 级别的质量，速度快数倍；显存紧张时首选 |
+| `distil-large-v3` | 1.5GB | **仅英文** | 英文专用，非英文内容不要用 |
+
+**首次运行会联网下载**，控制台会打印体积和镜像提示。国内网络建议先设镜像：
+
+```bash
+# CMD
+set HF_ENDPOINT=https://hf-mirror.com
+# PowerShell
+$env:HF_ENDPOINT='https://hf-mirror.com'
+```
+
+下载过程没有进度条、会静默等待，属正常现象。已有离线模型的，直接 `--model <模型目录>`。
+
+---
+
+## 性能参考
+
+实测环境：i5-13400F（10C16T）/ Windows 11 / medium / int8 / CPU，10.4s 音频耗时 9.7s，约 **1.08 倍实时**（≈8.9 秒/10 秒音频）。
+
+- **CPU**：medium 约 1 倍实时；large-v3 约 0.3~0.5 倍实时（即 10 分钟音频要 20-30 分钟），纯 CPU 不建议上 large。
+- **GPU**（如 RTX 3060 Ti 8GB + 装好 CUDA 12 运行库）：large-v3 通常可达 20 倍以上实时，一条 60 秒短视频 2-3 秒出字幕。
+- 模型加载有一次性开销（CPU 约 3s，GPU 约 6s），批量跑时被摊薄，不用在意。
+
+> 以上 GPU 数字是数量级参考，实际取决于显卡和音频长度，请以自己机器实测为准。
 
 ---
 
@@ -24,103 +119,96 @@
 
 ### 1. 识别引擎：faster-whisper × CTranslate2
 
-- **Whisper** 是 OpenAI 开源的通用语音识别模型，结构为编码器-解码器 Transformer，在 68 万小时多语言弱监督数据上训练，天然支持多语言识别与自动语种判断。
-- **faster-whisper** 用 **CTranslate2** 推理引擎重写 Whisper：对模型权重做 **int8 / float16 量化**，在保持精度的前提下实现 **4 倍以上推理加速**、显存占用减半。
-- 本项目默认使用 `small` / `medium` 两个规格的 CTranslate2 转换版模型（来自 HuggingFace `Systran/faster-whisper-*`）。
+- **Whisper** 是 OpenAI 开源的通用语音识别模型，编码器-解码器 Transformer，在 68 万小时多语言弱监督数据上训练，天然支持多语言识别与语种判断。
+- **faster-whisper** 用 **CTranslate2** 推理引擎重写：对权重做 int8 / float16 量化，官方称在保持精度的前提下可达 4 倍以上推理加速、显存占用减半。
+- 本项目使用 CTranslate2 转换版模型（HuggingFace `Systran/faster-whisper-*`）。
 
 ### 2. VAD 静音过滤
 
-- 转写前先用 **Silero VAD**（语音活动检测）扫描音频，只保留"有人声"的片段，跳过静音、背景音乐和噪声。
-- 控制台输出的 `VAD 后 xx.x s` 即过滤后的有效语音时长——**如果为 0.0s，说明整段没有可识别的人声**。
+转写前用 **Silero VAD** 扫描音频，只保留"有人声"的片段，跳过静音、背景音乐。控制台输出的 `VAD后 xx.x s` 即有效语音时长——**为 0.0s 说明整段没有可识别人声**。
 
-### 3. 语言检测与置信度（重点）
+### 3. 语言检测与置信度
 
-- Whisper 解码时会对"下一段属于哪种语言"输出一个概率分布（覆盖 99 种语言），**取概率最高的语言作为检测结果**，该概率即置信度。
-- 经验判断标准：
+Whisper 解码时对"这段属于哪种语言"输出概率分布（覆盖 99 种语言），取最高者作为结果，该概率即置信度。
 
-  | 置信度 | 含义 | 建议 |
-  | --- | --- | --- |
-  | ≥ 90% | 非常可靠 | 直接采信 |
-  | 50% ~ 90% | 基本可靠 | 可采信，注意口音/噪声 |
-  | ≈ 43.7%（≈1/99） | 模型在 99 种语言中"瞎猜" | **大概率没有清晰人声**（纯音乐/无声），不代表该视频真是英语 |
+| 置信度 | 含义 | 建议 |
+| --- | --- | --- |
+| ≥ 90% | 非常可靠 | 直接采信 |
+| 50% ~ 90% | 基本可靠 | 可采信，注意口音/噪声 |
+| ≈ 43.7%（≈1/99） | 在 99 种语言里"瞎猜" | **大概率没有清晰人声**，不代表真是英语 |
 
-- 所以当看到 `英语 (en) 43.7%` 时，先播放确认：**它大概率是纯背景音乐片段**，而不是识别错误。
+### 4. 设备探测
 
-### 4. 设备自动检测（auto 模式）
-
-- 先通过 `ctranslate2.get_cuda_device_count()` 探测 NVIDIA 显卡；
-- 发现显卡后，再用一个空特征矩阵做**真实推理探测**，确认 cublas/cudnn 运行库真的可用（防止"模型加载成功、转写时报 DLL 缺失"的坑）；
-- 探测失败自动回退 **CPU + int8 量化**，保证任何机器都能正常出结果。
+`ctranslate2.get_cuda_device_count()` 只看显卡数量，**不代表能用**——真正决定成败的是 cublas/cudnn 能否加载。所以本项目在探测到显卡后，会额外跑一次空特征矩阵推理来验证，失败则回退 CPU，并把缺什么库打印出来。
 
 ---
 
-## 快速开始
+## 便携版（绿色免安装）
 
-### 命令行用法
-
-```bash
-python batch_transcribe.py <文件夹或文件...> [--model small|medium|...] [--device auto|cpu|cuda] [--srt 输出目录] [--no-srt]
-```
-
-### 示例
+`gen_portable.py` 生成目录结构、启动器和说明；可选把现成运行环境与模型一起复制进去：
 
 ```bash
-# 批量转写整个文件夹，字幕导出到桌面"转写字幕"
-python batch_transcribe.py D:\视频
+# 只生成骨架
+python gen_portable.py
 
-# 指定 medium 模型 + 自定义字幕目录
-python batch_transcribe.py D:\视频 --model medium --srt D:\字幕
-
-# 单文件快速转写（自动检测语言）
-python fw-demo.py 音频.mp4 medium
+# 生成到指定目录，并带上运行环境和模型
+python gen_portable.py D:\pack --python-dir C:\pyembed --model models\large-v3
 ```
 
-### 便携版（绿色免安装）
+生成的包里：
 
-运行 `gen_portable.py` 可生成便携包目录结构（内置 Python 运行环境 + 模型），打包发给别人：
+```
+批量转写.cmd / 单个转写.cmd   启动器（纯 ASCII + 路径全部加引号 + CRLF）
+python\                       内置运行环境
+scripts\                      转写程序
+models\                       模型（优先用 large-v3，否则用第一个子目录）
+output\                       字幕与 转写日志.txt
+使用说明.txt                  中文说明（UTF-8）
+```
 
-- 解压即用，无需安装 Python、无需联网下载模型
-- 双击 `批量转写.cmd`，或把文件/文件夹**拖到图标上**松手即可
-- 字幕自动输出到包内 `输出字幕` 目录
+启动器刻意**只用英文和 ASCII**：老版本把中文目录名写进 GBK 编码的 `.cmd`，在非中文代码页（英文系统、`chcp 65001`、UTF-8 Beta）下会把字幕吐进一个乱码文件夹。现在也支持路径里带空格、括号、`&`。
 
-> ⚠️ 便携包体积较大（medium 模型压缩后约 1.4GB），不建议提交到 Git 仓库，按需自行生成。
+> 便携包体积大（large-v3 压缩后约 1.5GB+），不要提交到仓库，`.gitignore` 已排除。
+
+---
+
+## 常见问题
+
+**Q1：5 个视频只出了 3 个字幕？**
+现在每个视频都会生成字幕：有语音的正常写，没语音的生成**空字幕（0 条）**，所以文件数一定和视频数一致。空文件导入剪映/PR 得到 0 条字幕，不会多出文字。
+
+**Q2：字幕里出现莫名其妙的一行字？**
+如果字幕条数明显多于实际说话次数，多半是模型在静音/音乐段"幻听"。换 `large-v3`，或确认 `vad_filter` 生效（默认开启），必要时把音频转成 wav 再处理。
+
+**Q3：置信度很低 / 识别不准？**
+换更大的模型（`medium` → `large-v3`）；确认音频里确实有人声、噪声别太大；小语种用 `large-v3` 效果明显优于 `small`。
+
+**Q4：报 `cublas64_12.dll is not found`？**
+缺 CUDA 12 运行库。`pip install nvidia-cublas-cu12 nvidia-cudnn-cu12`，或加 `--device cpu`。程序默认会自动回退，不会中断任务。
+
+**Q5：字幕是乱码？**
+SRT 为 UTF-8 编码，剪映/PR 直接导入即可；记事本打开请选 UTF-8。
+
+**Q6：转写中途 Ctrl+C 了，前面的结果还在吗？**
+在。已完成的字幕已经落盘，日志也会记录已完成部分。
+
+**Q7：想多人/多机批量跑？**
+`--workers` 提高单机并发；跨机器直接把文件夹分片传给不同机器，`--model` 指向共享目录里的模型即可。
 
 ---
 
 ## 项目结构
 
 ```
-├── batch_transcribe.py    # 批量转写主程序（语言检测 + SRT 导出 + 设备自适应）
-├── fw-demo.py             # 单文件快速转写示例
-└── gen_portable.py        # 便携版打包脚本（生成绿色免安装包结构）
+├── batch_transcribe.py   # 批量转写主程序（语言检测 + SRT + 设备自适应 + 日志）
+├── fw-demo.py            # 单文件转写
+├── whisper_common.py     # 公共模块：语言表、模型加载、GPU 探测、格式化
+├── gen_portable.py       # 生成便携版目录结构与启动器
+├── requirements.txt      # 依赖
+├── LICENSE               # MIT
+└── .gitattributes        # 换行符约束（.cmd 必须 CRLF）
 ```
-
-## 依赖
-
-```
-faster-whisper   # CTranslate2 版 Whisper
-ctranslate2     # 推理引擎
-numpy           # 音频特征处理
-av              # 音视频解码
-onnxruntime     # Silero VAD 运行
-```
-
-## 常见问题
-
-**Q1：5 个视频只出了 3 个字幕？**
-另外 2 个大概率没有检测到人声（置信度 ≈ 43.7%，VAD 后时长为 0）。当前版本会为这类视频生成占位字幕并标注"未检测到语音"，保证文件数对得上。
-
-**Q2：置信度低怎么办？**
-换 `medium` / `large-v3` 模型会明显改善；同时确认音频里确实有人声、噪声不要太大。
-
-**Q3：转写速度？**
-有 NVIDIA 显卡自动走 GPU（10 秒视频约 1 秒）；纯 CPU 下 medium 模型约 8 秒 / 10 秒音频，small 模型约 3 秒。
-
-**Q4：字幕是乱码？**
-SRT 文件为 UTF-8 编码，剪映/PR 直接导入即可；用记事本打开请选择"UTF-8"编码。
-
----
 
 ## 许可证
 
-MIT License。faster-whisper 项目遵循 MIT 协议；Whisper 模型权重版权归 OpenAI，使用请遵守其各自条款。
+MIT License，见 [LICENSE](LICENSE)。faster-whisper / CTranslate2 / Silero VAD 亦为 MIT；Whisper 模型权重版权归 OpenAI，使用请遵循其各自条款。

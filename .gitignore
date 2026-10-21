@@ -6,6 +6,11 @@ __pycache__/
 # 虚拟环境
 fw-venv/
 venv/
+.venv/
+
+# 模型权重（体积大，按需自行下载）
+models/
+*.bin
 
 # 上游源码（faster-whisper 官方仓库）
 faster-whisper-master/
@@ -21,6 +26,7 @@ test1.flac
 # 生成物（字幕、便携包、压缩包）
 输出字幕/
 转写字幕/
+output/
 便携版/
 便携包/
 *.zip
