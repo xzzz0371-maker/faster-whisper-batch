@@ -42,13 +42,14 @@ set "SCRIPTS=%~dp0scripts"
 set "OUTDIR=%~dp0output"
 set "TARGET="
 set "ARGS="
-set "MODEL="
 
 if not exist "%PY%" goto :no_python
 if not exist "%SCRIPTS%\\{script}" goto :no_scripts
 
-rem ---- pick a model: models\\large-v3 if present, else first subfolder ----
-if exist "%~dp0models\\large-v3\\" set "MODEL=%~dp0models\\large-v3"
+rem ---- model: FA_MODEL env wins, then models\\large-v3, then first subfolder ----
+rem      e.g.  set FA_MODEL=%~dp0models\\medium   before running this file
+if defined FA_MODEL set "MODEL=%FA_MODEL%"
+if not defined MODEL if exist "%~dp0models\\large-v3\\" set "MODEL=%~dp0models\\large-v3"
 if not defined MODEL for /d %%D in ("%~dp0models\\*") do if not defined MODEL set "MODEL=%%~fD"
 if not defined MODEL goto :no_model
 
@@ -139,6 +140,14 @@ README_TXT = """faster-whisper 离线转写工具（绿色便携版）
   有 NVIDIA 显卡并且装好 CUDA 12 运行库：走 GPU，很快。
   没有显卡：自动用 CPU（int8 量化）。
   注意：大模型（large-v3 / turbo）在纯 CPU 上会明显慢，可改用 medium 或 small。
+  显存不够时程序会自动把精度从 float16 降到 int8_float16，不会直接崩。
+
+【想换模型】
+  启动器默认优先用 models\\large-v3，没有就用 models 下第一个子文件夹。
+  临时换别的模型，在命令行里先设环境变量再运行：
+      set FA_MODEL=%~dp0models\\medium
+      批量转写.cmd "D:\\素材"
+  或者直接改 批量转写.cmd 里那行 "if not defined MODEL if exist ..."。
 
 【常见问题】
   - 双击后窗口一闪而过：可能被杀毒软件拦截，加信任。

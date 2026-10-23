@@ -164,17 +164,104 @@ def _gpu_hint_message(exc: Exception) -> str:
     return ""
 
 
+def _is_oom(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda failed with error out of memory" in text
+
+
+def _is_host_oom(exc: Exception) -> bool:
+    """主机内存不足（不是显存）。CT2 会报 mkl_malloc / failed to allocate memory"""
+    if isinstance(exc, MemoryError):
+        return True
+    text = str(exc).lower()
+    return "mkl_malloc" in text or "failed to allocate memory" in text
+
+
+def available_ram_gb():
+    """当前可用物理内存(GB)，取不到返回 None"""
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return None
+
+
+def _model_disk_gb(model: str):
+    """本地模型目录的权重大小(GB)，用于估算内存需求"""
+    if is_local_model(model):
+        bin_path = os.path.join(model, "model.bin")
+        if os.path.isfile(bin_path):
+            return os.path.getsize(bin_path) / (1024 ** 3)
+        total = 0
+        for root, _, names in os.walk(model):
+            for n in names:
+                try:
+                    total += os.path.getsize(os.path.join(root, n))
+                except OSError:
+                    pass
+        return total / (1024 ** 3) if total else None
+    guess = {
+        "large-v3": 3.1, "large": 3.1, "large-v2": 3.0, "large-v1": 3.0,
+        "large-v3-turbo": 1.6, "turbo": 1.6, "medium": 1.5, "medium.en": 1.5,
+        "small": 0.46, "small.en": 0.46, "base": 0.15, "tiny": 0.08,
+    }
+    return guess.get(model)
+
+
+def preflight_memory(model: str) -> None:
+    """加载前看一眼主机内存，不够就提前警告（比等到 mkl_malloc 崩掉友好）"""
+    need = _model_disk_gb(model)
+    avail = available_ram_gb()
+    if not need or not avail:
+        return
+    if avail < need * 1.8:
+        print(f"⚠ 主机可用内存只剩 {avail:.1f}GB，而该模型权重约 {need:.1f}GB。")
+        print("  大模型加载需要把权重读进内存，内存不足会报 mkl_malloc / out of memory。")
+        print("  建议：关掉浏览器等占内存的程序，或改用 --model medium（约 1.5GB）。")
+
+
 def load_model(model: str, device: str = "auto"):
     """加载模型，返回 (model, 设备标识)。
 
     device="auto"：先探测 GPU，再用一个空特征矩阵做**真实推理**，
-    确认 cublas/cudnn 真的能加载；失败自动回退 CPU(int8)。
-    device="cuda"：强制 GPU，失败时抛出带修复建议的 RuntimeError。
+    确认 cublas/cudnn 真的能加载；GPU 不可用则回退 CPU(int8)。
+    device="cuda"：强制 GPU，全部尝试失败时抛带修复建议的 RuntimeError。
+
+    GPU 上按 float16 -> int8_float16 -> int8 依次降级：
+    large-v3 的 float16 权重约 3.1GB，8G 显卡若已被桌面程序占掉一半就会 OOM，
+    降成 int8_float16 权重大约减半，仍能跑，精度只掉一点点。
     """
     import numpy as np
     from faster_whisper import WhisperModel
 
     assert device in ("auto", "cpu", "cuda"), device
+
+    preflight_memory(model)
+    probe = np.zeros((80, 3000), dtype="float32")
+
+    def _try(dev: str, compute_type: str):
+        m = WhisperModel(model, device=dev, compute_type=compute_type)
+        # 真实推理探测：确认运行库真的能加载，而不是只建了对象
+        m.encode(probe)
+        return m
 
     if device in ("auto", "cuda"):
         try:
@@ -187,35 +274,65 @@ def load_model(model: str, device: str = "auto"):
                 raise RuntimeError(f"无法检测 CUDA 设备: {exc}") from exc
 
         if cuda_count > 0:
+            print(f"检测到 {cuda_count} 个 CUDA 设备，"
+                  f"{'强制使用 GPU' if device == 'cuda' else '尝试 GPU 加速'} ...")
+            errors = []
+            for compute_type in ("float16", "int8_float16", "int8"):
+                try:
+                    m = _try("cuda", compute_type)
+                except Exception as exc:
+                    errors.append((compute_type, exc))
+                    if _is_host_oom(exc):
+                        print(f"主机内存不足，无法加载权重（{compute_type}），继续尝试更省内存的精度 ...")
+                    elif _is_oom(exc):
+                        print(f"显存不足，{compute_type} 放不下" +
+                              ("，降级重试 ..." if compute_type != "int8" else " ..."))
+                    continue
+                if compute_type != "float16":
+                    print(f"GPU 加速可用 (cuda/{compute_type})，"
+                          f"已从 float16 降级（显存/内存吃紧，精度影响很小）")
+                else:
+                    print("GPU 加速可用 (cuda/float16)")
+                return m, f"cuda/{compute_type}"
+
+            # GPU 全试失败
+            last_exc = errors[-1][1] if errors else RuntimeError("未知错误")
+            hint = _gpu_hint_message(last_exc)
+            detail = "；".join(f"{ct}: {e}" for ct, e in errors)
             if device == "cuda":
-                print(f"检测到 {cuda_count} 个 CUDA 设备，强制使用 GPU ...")
-            else:
-                print(f"检测到 {cuda_count} 个 CUDA 设备，尝试 GPU 加速 ...")
-            try:
-                m = WhisperModel(model, device="cuda", compute_type="float16")
-                # 真实推理探测：确认 cublas/cudnn 运行库可用，而不是只建了对象
-                m.encode(np.zeros((80, 3000), dtype="float32"))
-                print("GPU 加速可用 (cuda/float16)")
-                return m, "cuda/float16"
-            except Exception as exc:
-                hint = _gpu_hint_message(exc)
-                if device == "cuda":
-                    raise RuntimeError(
-                        f"GPU 不可用: {exc}\n{hint}" if hint else f"GPU 不可用: {exc}"
-                    ) from exc
-                print(f"GPU 不可用，回退 CPU。原因: {exc}")
-                if hint:
-                    print(hint)
+                raise RuntimeError(
+                    "GPU 不可用:\n  " + detail + ("\n" + hint if hint else "")
+                ) from last_exc
+            print(f"GPU 不可用，回退 CPU。原因: {last_exc}")
+            if hint:
+                print(hint)
         elif device == "cuda":
             raise RuntimeError("没有检测到可用的 CUDA 设备，请去掉 --device cuda 或改用 --device cpu")
 
     print("使用 CPU 模式 (int8) ...")
-    return WhisperModel(model, device="cpu", compute_type="int8"), "cpu/int8"
+    try:
+        return _try("cpu", "int8"), "cpu/int8"
+    except Exception as exc:
+        if _is_host_oom(exc):
+            avail = available_ram_gb()
+            need = _model_disk_gb(model)
+            raise RuntimeError(
+                f"主机内存不足，模型加载失败：{exc}\n"
+                f"  当前可用内存 {avail:.1f}GB，模型权重约 {need:.1f}GB。\n"
+                "  处理办法：关闭浏览器/剪辑软件等占内存的程序，"
+                "或改用更小的模型（--model medium / small）。"
+                if avail and need else f"主机内存不足，模型加载失败：{exc}"
+            ) from exc
+        print(f"CPU int8 不可用({exc})，改用 float32 ...")
+        try:
+            return _try("cpu", "float32"), "cpu/float32"
+        except Exception as exc2:
+            raise RuntimeError(f"CPU 加载失败: {exc2}") from exc2
 
 
 def warn_if_slow_on_cpu(device_tag: str, model: str) -> None:
     """大模型在 CPU 上会非常慢，提前打招呼"""
-    if device_tag != "cpu/int8":
+    if not device_tag.startswith("cpu/"):
         return
     heavy = {"large-v1", "large-v2", "large-v3", "large", "large-v3-turbo", "turbo"}
     name = os.path.basename(os.path.normpath(model)).lower() if is_local_model(model) else model

@@ -33,13 +33,21 @@ cd faster-whisper-batch
 pip install -r requirements.txt
 ```
 
-**GPU 加速（可选，仅 NVIDIA）**：ctranslate2 需要 CUDA 12 的 `cublas64_12.dll` / cuDNN。
+**GPU 加速（可选，仅 NVIDIA）**：ctranslate2 需要 CUDA 12 的 `cublas64_12.dll` / cuDNN 9。
 
 ```bash
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-不装也能正常用——程序会用一个空特征矩阵做**真实推理探测**，探测失败自动回退 CPU(int8)，并在控制台说明原因，不会出现"模型加载成功、转写时报 DLL 缺失"。
+不装也能正常用——程序会用一个空特征矩阵做**真实推理探测**，探测失败自动回退 CPU(int8)，并在控制台说明原因。
+
+装好这两个包后，`site-packages/nvidia/*/bin` 并不在 Windows 的 DLL 搜索路径里，ctranslate2 仍然找不到。两种解决办法（便携包已内置，无需处理）：
+
+```python
+# 办法一：在 site-packages 下放一个 sitecustomize.py，把 nvidia 的 bin 目录注册进 DLL 搜索路径
+#（便携版就是这么做的，见 python\Lib\site-packages\sitecustomize.py）
+# 办法二：把那几个 bin 目录加到 PATH，或把 DLL 复制到 python\ 根目录
+```
 
 ---
 
@@ -105,13 +113,19 @@ $env:HF_ENDPOINT='https://hf-mirror.com'
 
 ## 性能参考
 
-实测环境：i5-13400F（10C16T）/ Windows 11 / medium / int8 / CPU，10.4s 音频耗时 9.7s，约 **1.08 倍实时**（≈8.9 秒/10 秒音频）。
+实测环境：i5-13400F（10C16T）+ RTX 3060 Ti 8GB / Windows 11 / 10.4s 英文音频。
 
-- **CPU**：medium 约 1 倍实时；large-v3 约 0.3~0.5 倍实时（即 10 分钟音频要 20-30 分钟），纯 CPU 不建议上 large。
-- **GPU**（如 RTX 3060 Ti 8GB + 装好 CUDA 12 运行库）：large-v3 通常可达 20 倍以上实时，一条 60 秒短视频 2-3 秒出字幕。
-- 模型加载有一次性开销（CPU 约 3s，GPU 约 6s），批量跑时被摊薄，不用在意。
+| 配置 | 耗时 | 实时率 |
+| --- | --- | --- |
+| CPU medium int8 | 9.7s | 1.08x |
+| **GPU medium float16** | **0.91s** | **11.4x** |
+| GPU large-v3（float16，显存/内存充裕时） | 约 1.5-2s | 约 5-7x（估算） |
 
-> 以上 GPU 数字是数量级参考，实际取决于显卡和音频长度，请以自己机器实测为准。
+- **GPU 与 CPU 差约 10 倍**，批量跑素材必须修好 GPU。
+- 模型加载有一次性开销（CPU 约 3s，GPU 约 6-8s），批量跑时被摊薄。
+- 显存/内存吃紧时**自动降精度**：`float16 → int8_float16 → int8`，权重大约减半，精度影响很小，不会直接崩。
+- large-v3 的 float16 权重约 3.1GB。8GB 显卡如果已被浏览器/剪辑软件占掉一半显存，或主机内存不足（加载要把 3GB 权重读进内存），会加载失败——程序会打印当前可用内存和替代方案。
+- `--workers` 在 CPU 上无收益（int8 已吃满核心），GPU 上才值得开。
 
 ---
 
@@ -159,11 +173,18 @@ python gen_portable.py D:\pack --python-dir C:\pyembed --model models\large-v3
 
 ```
 批量转写.cmd / 单个转写.cmd   启动器（纯 ASCII + 路径全部加引号 + CRLF）
-python\                       内置运行环境
+python\                       内置运行环境（含 CUDA 12 运行库）
 scripts\                      转写程序
 models\                       模型（优先用 large-v3，否则用第一个子目录）
 output\                       字幕与 转写日志.txt
 使用说明.txt                  中文说明（UTF-8）
+```
+
+换模型不用改文件，设个环境变量即可覆盖启动器的自动选择：
+
+```bat
+set FA_MODEL=%~dp0models\medium
+批量转写.cmd "D:\素材"
 ```
 
 启动器刻意**只用英文和 ASCII**：老版本把中文目录名写进 GBK 编码的 `.cmd`，在非中文代码页（英文系统、`chcp 65001`、UTF-8 Beta）下会把字幕吐进一个乱码文件夹。现在也支持路径里带空格、括号、`&`。
@@ -192,7 +213,13 @@ SRT 为 UTF-8 编码，剪映/PR 直接导入即可；记事本打开请选 UTF-
 **Q6：转写中途 Ctrl+C 了，前面的结果还在吗？**
 在。已完成的字幕已经落盘，日志也会记录已完成部分。
 
-**Q7：想多人/多机批量跑？**
+**Q7：报 `mkl_malloc: failed to allocate memory` / 显存不足？**
+这多半不是显卡问题：
+- `mkl_malloc` 是**主机内存**不足——模型权重要先读进内存，large-v3 要约 3GB 连续空间。关掉浏览器/剪辑软件，或改用 `--model medium`。
+- `CUDA failed with error out of memory` 是**显存**不足。程序会自动降精度重试（float16 → int8_float16 → int8）；8GB 显卡建议关掉占显存的程序，或直接用 `medium`。
+- 加载前程序会打印"可用内存 X GB / 模型约 Y GB"，数值明显不够时别硬上。
+
+**Q8：想多人/多机批量跑？**
 `--workers` 提高单机并发；跨机器直接把文件夹分片传给不同机器，`--model` 指向共享目录里的模型即可。
 
 ---
