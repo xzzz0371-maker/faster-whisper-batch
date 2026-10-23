@@ -246,7 +246,7 @@ def main() -> int:
     w(os.path.join(root, "models", "README-放模型到这里.txt"), MODELS_NOTE, crlf=True)
 
     # 5. 可选：复制运行环境与模型
-    has_python = copy_tree_if_exists(args.python_dir, os.path.join(root, "python"), "Python 运行环境")
+    copy_tree_if_exists(args.python_dir, os.path.join(root, "python"), "Python 运行环境")
     for m in args.model:
         if os.path.isdir(m):
             name = os.path.basename(os.path.normpath(m))
@@ -254,17 +254,25 @@ def main() -> int:
         else:
             print(f"[跳过] 模型目录不存在: {m}")
 
-    # 6. 自检 + 结论
+    # 6. 自检 + 结论（判断目录里实际有没有，而不是只看参数传没传）
+    python_ok = os.path.isfile(os.path.join(root, "python", "python.exe"))
+    models_dir = os.path.join(root, "models")
+    model_dirs = [d for d in os.listdir(models_dir)
+                  if os.path.isdir(os.path.join(models_dir, d))]
+    model_names = [os.path.basename(n) for n in model_dirs]
+
     print("\n" + "=" * 60)
     print("生成完成，目录内容：")
     for name in sorted(os.listdir(root)):
         full = os.path.join(root, name)
         print(f"  {'[目录]' if os.path.isdir(full) else '[文件]'} {name}")
     print("=" * 60)
-    if not has_python:
+    print(f"运行环境: {'已就绪' if python_ok else '缺失'}"
+          f"    模型: {', '.join(sorted(model_names)) if model_names else '无'}")
+    if not python_ok:
         print("⚠ 还没有 python 目录：启动器会直接报错退出。补上再分发：")
         print("    python gen_portable.py --python-dir <现成的 Python 运行环境目录>")
-    if not args.model:
+    if not model_names:
         print("⚠ 还没有模型：把 CTranslate2 模型放进 models\\large-v3（或任意子目录）。")
     print("提示：分发前把整个目录压成 zip 即可，接收方解压双击 .cmd 就能用。")
     return 0
