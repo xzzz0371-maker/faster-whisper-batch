@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import unicodedata
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # 语言表：faster-whisper 返回 ISO 639-1 代码，这里翻成中文名；未收录的原样显示
@@ -238,6 +239,42 @@ def preflight_memory(model: str) -> None:
         print("  建议：关掉浏览器等占内存的程序，或改用 --model medium（约 1.5GB）。")
 
 
+def _n_mels_of(model) -> Optional[int]:
+    """取模型期望的 mel 维数。large-v3 是 128，small/medium 是 80，
+    探测矩阵用错维数会把能用的模型误判成不可用。"""
+    for obj in (getattr(model, "model", None),
+                getattr(getattr(model, "model", None), "model", None)):
+        value = getattr(obj, "n_mels", None)
+        if isinstance(value, int) and 0 < value <= 256:
+            return value
+    return None
+
+
+def _probe(model, np) -> None:
+    """空特征推理，确认运行库/显存真的能用。维数自动适配（80 / 128）。"""
+    candidates = []
+    detected = _n_mels_of(model)
+    if detected:
+        candidates.append(detected)
+    for fallback in (80, 128):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    last_shape_err = None
+    for n_mels in candidates:
+        try:
+            model.encode(np.zeros((n_mels, 3000), dtype="float32"))
+            return
+        except Exception as exc:
+            text = str(exc).lower()
+            if "shape" in text or "expected an input" in text:
+                last_shape_err = exc   # 维数不对，换下一个再试
+                continue
+            raise                       # 显存/运行库问题，直接上报
+    if last_shape_err:
+        raise last_shape_err
+
+
 def load_model(model: str, device: str = "auto"):
     """加载模型，返回 (model, 设备标识)。
 
@@ -255,12 +292,11 @@ def load_model(model: str, device: str = "auto"):
     assert device in ("auto", "cpu", "cuda"), device
 
     preflight_memory(model)
-    probe = np.zeros((80, 3000), dtype="float32")
 
     def _try(dev: str, compute_type: str):
         m = WhisperModel(model, device=dev, compute_type=compute_type)
         # 真实推理探测：确认运行库真的能加载，而不是只建了对象
-        m.encode(probe)
+        _probe(m, np)
         return m
 
     if device in ("auto", "cuda"):
@@ -328,6 +364,39 @@ def load_model(model: str, device: str = "auto"):
             return _try("cpu", "float32"), "cpu/float32"
         except Exception as exc2:
             raise RuntimeError(f"CPU 加载失败: {exc2}") from exc2
+
+
+def sibling_models(model: str, smaller_than: bool = True) -> list:
+    """同一 models 目录下的其他模型目录，按权重大小从大到小返回。
+
+    smaller_than=True 时只返回比当前模型更小的（降级用），
+    免得 medium 加载失败却跑去试更大的 large-v3。
+    """
+    if not is_local_model(model):
+        return []
+    target = os.path.abspath(model)
+    parent = os.path.dirname(target)
+
+    def _bin_size(path: str) -> int:
+        try:
+            return os.path.getsize(os.path.join(path, "model.bin"))
+        except OSError:
+            return -1
+
+    current_size = _bin_size(target)
+    found = []
+    try:
+        for name in os.listdir(parent):
+            path = os.path.join(parent, name)
+            if path == target or not os.path.isfile(os.path.join(path, "model.bin")):
+                continue
+            size = _bin_size(path)
+            if smaller_than and current_size > 0 and size >= current_size:
+                continue
+            found.append((size, path))
+    except OSError:
+        return []
+    return [path for _, path in sorted(found, reverse=True)]
 
 
 def warn_if_slow_on_cpu(device_tag: str, model: str) -> None:

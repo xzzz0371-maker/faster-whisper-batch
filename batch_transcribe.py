@@ -36,6 +36,7 @@ from whisper_common import (  # noqa: E402  (必须在 sys.path 补齐之后导�
     lang_name,
     load_model,
     pad,
+    sibling_models,
     truncate_disp,
     warn_if_slow_on_cpu,
 )
@@ -298,13 +299,29 @@ def main() -> int:
     announce_model(args.model)
 
     t0 = time.time()
+    model = None
+    device_tag = "-"
+    model_used = args.model
     try:
         model, device_tag = load_model(args.model, args.device)
     except Exception as exc:
         print(f"\n模型加载失败: {exc}")
-        return 2
+        # 兜底：同一 models 目录里还有更小的模型就换一个，别让整批任务直接失败
+        for alt in sibling_models(args.model, smaller_than=True)[:2]:
+            name = os.path.basename(alt)
+            print(f"\n改用同目录下更小的模型 {name} 重试 ...")
+            try:
+                model, device_tag = load_model(alt, args.device)
+                model_used = alt
+                print(f"已切换为 {name}（{device_tag}）。如需固定，请显式传 --model {name}")
+                break
+            except Exception as alt_exc:
+                print(f"  {name} 也不可用: {alt_exc}")
+        if model is None:
+            print("\n没有可用的模型，退出。")
+            return 2
     print(f"模型加载完成 ({device_tag})，耗时 {time.time()-t0:.1f}s")
-    warn_if_slow_on_cpu(device_tag, args.model)
+    warn_if_slow_on_cpu(device_tag, model_used)
     if args.workers > 1 and device_tag.startswith("cpu"):
         print("提示: CPU 模式下多线程没有收益（int8 已吃满所有核心），"
               "实测 --workers 2 反而更慢，建议保持默认 1。")
@@ -352,7 +369,7 @@ def main() -> int:
     print_summary(results, total)
     if log_path:
         os.makedirs(srt_dir, exist_ok=True)
-        write_log(log_path, results, device_tag, args.model, interrupted)
+        write_log(log_path, results, device_tag, model_used, interrupted)
 
     return 130 if interrupted else 0
 
