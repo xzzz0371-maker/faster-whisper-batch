@@ -99,14 +99,14 @@ def collect_files(paths: List[str], skip_dirs: List[str]) -> List[str]:
     return files
 
 
-def build_srt_path(out_dir: str, src_path: str, lang: str, prob: float, used: Set[str]) -> str:
-    """生成不重复的字幕路径。
+def build_srt_path(out_dir: str, src_path: str, suffix: str, used: Set[str]) -> str:
+    """生成不重复的字幕路径。suffix 例如 "英语_99.3%" 或 "无音频"。
 
     - 同一批里不同目录存在同名文件时，用父目录名做前缀，仍冲突再加 _2/_3
     - 路径过长时截断文件名，避免 Windows 260 字符限制
     """
     stem = os.path.splitext(os.path.basename(src_path))[0]
-    base = f"{stem}_{lang}_{prob:.1%}"
+    base = f"{stem}_{suffix}"
 
     candidate = base
     if candidate.lower() in used:
@@ -168,14 +168,20 @@ def transcribe_one(model, filepath: str, srt_dir: Optional[str], used_names: Set
 
     if srt_dir:
         os.makedirs(srt_dir, exist_ok=True)
-        srt_path = build_srt_path(srt_dir, filepath, res.lang, res.prob, used_names)
+        if lines:
+            # 命名：原文件名_语种_置信度.srt
+            suffix = f"{res.lang}_{res.prob:.1%}"
+        else:
+            # 命名：原文件名_无音频.srt（0 条字幕，不写语言/置信度——那是误判值）
+            suffix = "无音频"
+        srt_path = build_srt_path(srt_dir, filepath, suffix, used_names)
         write_srt(srt_path, lines)
         res.srt_path = srt_path
         if lines:
             print(f"   字幕已保存: {srt_path}")
         else:
             # 空文件而不是"未检测到语音"占位——占位文本会被剪映当真字幕烧进画面
-            print(f"   未检测到语音，已生成空字幕(0 条): {srt_path}")
+            print(f"   未检测到人声，已生成空字幕(0 条): {srt_path}")
     return res
 
 
@@ -230,7 +236,7 @@ def print_summary(results: List[Result], total_files: int) -> None:
             print(pad(truncate_disp(r.name, w_name), w_name)
                   + pad("转写失败", w_lang) + f"({r.error[:28]})")
             continue
-        status_txt = "无语音" if r.status == "no_speech" else "ok"
+        status_txt = "无音频" if r.status == "no_speech" else "ok"
         print(pad(truncate_disp(r.name, w_name), w_name)
               + pad(f"{r.lang}({r.code})", w_lang)
               + pad(f"{r.prob:.1%}", w_prob)
@@ -243,7 +249,7 @@ def print_summary(results: List[Result], total_files: int) -> None:
     n_bad = sum(1 for r in results if r.status == "failed")
     total_el = sum(r.elapsed for r in results)
     print(f"\n共 {total_files} 个文件，已完成 {len(results)} 个"
-          f"（正常 {n_ok} / 无语音 {n_no} / 失败 {n_bad}），"
+          f"（正常 {n_ok} / 无音频 {n_no} / 失败 {n_bad}），"
           f"转写累计耗时 {total_el:.1f}s")
 
 
